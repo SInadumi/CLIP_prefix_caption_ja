@@ -1,42 +1,60 @@
-import torch
-import skimage.io as io
-import clip
-from PIL import Image
-import pickle
-import json
 import os
+import json
+import torch
+import pickle
+import scripts.model.japanese_clip as ja_clip
+from PIL import Image
 from tqdm import tqdm
-import argparse
+from transformers import T5Tokenizer
+from load_gazevqa import get_coco_path
 
 
-def main(clip_model_type: str):
-    device = torch.device('cuda:0')
-    clip_model_name = clip_model_type.replace('/', '_')
-    out_path = f"./data/coco/oscar_split_{clip_model_name}_train.pkl"
-    clip_model, preprocess = clip.load(clip_model_type, device=device, jit=False)
-    with open('./data/coco/annotations/train_caption.json', 'r') as f:
-        data = json.load(f)
-    print("%0d captions loaded from json " % len(data))
+def main():
+    # config tokenizer, clip, STAIR dataset
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    input_path = f"{os.environ['STAIR_CAPTION_DIR']}/stair_captions_v1.2_train.json"
+    out_path = f"{os.environ['STAIR_CAPTION_DIR']}/stair_split_ViT-B-16_train"
+    coco_dir = f"{os.environ['COCO_DIR']}"
+    model, preprocess = ja_clip.load(
+        "rinna/japanese-clip-vit-b-16",
+        cache_dir="/tmp/japanese_clip",
+        device=device
+    )
+    tokenizer = T5Tokenizer.from_pretrained("rinna/japanese-roberta-base")
+    data = json.load(open(input_path, 'r', encoding="utf-8"))
+    print("%0d captions loaded from json " % len(data["annotations"]))
+
     all_embeddings = []
     all_captions = []
-    for i in tqdm(range(len(data))):
-        d = data[i]
+
+    ids = 0
+    for _ in tqdm(range(len(data["annotations"])), disable=True):
+        d = data["annotations"][ids]
+
+        # encode mscoco image
         img_id = d["image_id"]
-        filename = f"./data/coco/train2014/COCO_train2014_{int(img_id):012d}.jpg"
-        if not os.path.isfile(filename):
-            filename = f"./data/coco/val2014/COCO_val2014_{int(img_id):012d}.jpg"
-        image = io.imread(filename)
-        image = preprocess(Image.fromarray(image)).unsqueeze(0).to(device)
+        image = Image.open(get_coco_path(coco_dir, img_id))
+        image = preprocess(image).unsqueeze(0).to(device)
         with torch.no_grad():
-            prefix = clip_model.encode_image(image).cpu()
-        d["clip_embedding"] = i
+            prefix = model.get_image_features(image).cpu()
+        d["clip_embedding"] = ids
+        # tokenize caption text (using T5Tokenizer)
+        d["caption"] = tokenizer.tokenize(d["caption"])
         all_embeddings.append(prefix)
         all_captions.append(d)
-        if (i + 1) % 10000 == 0:
-            with open(out_path, 'wb') as f:
-                pickle.dump({"clip_embedding": torch.cat(all_embeddings, dim=0), "captions": all_captions}, f)
 
-    with open(out_path, 'wb') as f:
+        # save embeddings and caption per 10000 times
+        if (ids + 1) % 10000 == 0:
+            with open(out_path + f"_{ids+1}.pkl", 'wb') as f:
+                pickle.dump({"clip_embedding": torch.cat(all_embeddings, dim=0), "captions": all_captions}, f)
+                # メモリ開放
+                del all_embeddings
+                del all_captions
+                all_embeddings = []
+                all_captions = []
+        ids += 1
+
+    with open(out_path + f"_{ids+1}.pkl", 'wb') as f:
         pickle.dump({"clip_embedding": torch.cat(all_embeddings, dim=0), "captions": all_captions}, f)
 
     print('Done')
@@ -45,7 +63,4 @@ def main(clip_model_type: str):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--clip_model_type', default="ViT-B/32", choices=('RN50', 'RN101', 'RN50x4', 'ViT-B/32'))
-    args = parser.parse_args()
-    exit(main(args.clip_model_type))
+    main()
